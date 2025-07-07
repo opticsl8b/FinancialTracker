@@ -98,7 +98,7 @@ async function fetchAndProcessLatestData() {
     } catch (error) {
         console.error('Error in fetchAndProcessLatestData:', error);
     }
-}
+} // <-- 請確保這個 } 符號存在！它是 fetchAndProcessLatestData 函式的結束
 
 // Schedule the data fetching
 // Runs immediately on startup and then every 4 hours
