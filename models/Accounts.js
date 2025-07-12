@@ -29,31 +29,33 @@ module.exports = (sequelize) => {
             comment: 'Type of account (e.g., physical, digital, salary, joint, savings, loan)'
         },
         balance: {
-            type: DataTypes.DECIMAL(18, 2), // 通常法幣餘額保留兩位小數
+            type: DataTypes.DECIMAL(18, 2),
             allowNull: false,
             defaultValue: 0.00,
             comment: 'Current balance of the account'
         },
-        // TODO: Add userId foreign key association later
-        // userId: {
-        //     type: DataTypes.UUID, // Assuming UUID for userId
-        //     allowNull: false,
-        //     references: {
-        //         model: 'Users', // Reference to the Users table
-        //         key: 'id'
-        //     }
-        // }
+        // *** 修正部分 開始 ***
+        userId: {
+            type: DataTypes.UUID,
+            allowNull: true, // 改為 true，允許現有數據暫時沒有 userId
+            references: {
+                model: 'users', // 指向 'users' 資料表
+                key: 'id'
+            }
+        }
+        // *** 修正部分 結束 ***
     }, {
-        tableName: 'fiat_accounts', // 更改為 fiat_accounts 以區分
+        tableName: 'fiat_accounts',
         timestamps: true,
         createdAt: true,
         updatedAt: true
     });
 
-    // Define association later if User model is implemented
-    // Account.associate = (models) => {
-    //     Account.belongsTo(models.User, { foreignKey: 'userId' });
-    // };
+    // *** 新增關聯定義 ***
+    Account.associate = (models) => {
+        Account.belongsTo(models.User, { foreignKey: 'userId', as: 'user' });
+        Account.hasMany(models.Transaction, { foreignKey: 'accountId', as: 'transactions', onDelete: 'CASCADE' });
+    };
 
     return Account;
 };
