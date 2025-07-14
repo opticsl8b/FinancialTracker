@@ -26,11 +26,18 @@ module.exports = (sequelize) => {
             allowNull: false,
             comment: '交易場所 (e.g., Binance, Uniswap)'
         },
+        // *** 修正部分：將 ENUM 改為 STRING 並加上驗證 ***
         status: {
-            type: DataTypes.ENUM('持有中', '已售出'),
+            type: DataTypes.STRING, // 改為 STRING
             allowNull: false,
             defaultValue: '持有中',
-            comment: '交易狀態'
+            comment: '交易狀態',
+            validate: {
+                isIn: {
+                    args: [['持有中', '已售出']],
+                    msg: "Status must be either '持有中' or '已售出'"
+                }
+            }
         },
         transactionDate: {
             type: DataTypes.DATE,
