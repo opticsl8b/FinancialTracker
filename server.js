@@ -20,7 +20,8 @@ const sequelize = new Sequelize(DATABASE_URL, {
     dialect: 'postgres',
     logging: false,
     dialectOptions: {
-        ssl: process.env.DB_SSL === 'true' ? { require: true, rejectUnauthorized: false } : false
+        ssl: process.env.DB_SSL === 'true' ? { require: true, rejectUnauthorized: false } : false,
+        client_encoding: 'UTF8'
     }
 });
 
@@ -55,30 +56,22 @@ async function initializeDatabase() {
 
 async function fetchAndPushToSheet() {
     console.log(`[${new Date().toISOString()}] Starting scheduled job: Fetching all rates and prices for Google Sheet.`);
-
     const sheetId = process.env.GOOGLE_SHEET_ID;
-    // *** 變更點 1：從環境變數讀取分頁名稱，如果沒有就預設為 '報價機' ***
     const sheetName = process.env.GOOGLE_SHEET_NAME || '報價機';
-
     if (!sheetId) {
         console.warn(`[${new Date().toISOString()}] GOOGLE_SHEET_ID is not set in .env file. Skipping Google Sheet update.`);
         return;
     }
-
     try {
         const cryptoSymbolsToFetch = ['BTC', 'ETH', 'BNB', 'SOL', 'DOGE', 'ADA', 'SUI', 'PEPE', 'APT', 'VIRTUAL'];
-
         const [twdAudRates, twdUsdtRates, cryptoPrices] = await Promise.all([
             ExchangeRateService.getTwdAudExchangeRate(),
             ExchangeRateService.getTwdUsdtExchangeRate(),
             ExchangeRateService.getCryptoPrices(cryptoSymbolsToFetch)
         ]);
-
         const sheetData = [];
         const timestamp = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
-
         sheetData.push(['項目', '買入價', '賣出價', '最後更新時間 (Asia/Taipei)']);
-
         if (twdAudRates && twdAudRates.buy) {
             sheetData.push(['TWD/AUD (台灣銀行現金)', twdAudRates.buy, twdAudRates.sell]);
         }
@@ -95,7 +88,6 @@ async function fetchAndPushToSheet() {
                 sheetData.push([`${symbol}/USD`, priceInfo.usd, 'N/A']);
             }
         }
-        
         for (let i = 1; i < sheetData.length; i++) {
             if(sheetData[i][0].includes('---')){
                 sheetData[i].push(timestamp);
@@ -103,31 +95,44 @@ async function fetchAndPushToSheet() {
             }
             sheetData[i].push(timestamp);
         }
-
-        // *** 變更點 2：使用變數來組合範圍字串 ***
         const range = `${sheetName}!A1`;
         await updateExchangeRatesToSheet(sheetId, range, sheetData);
-
         console.log(`[${new Date().toISOString()}] Successfully fetched and pushed data to Google Sheet.`);
-
     } catch (error) {
         console.error(`[${new Date().toISOString()}] An error occurred during the fetchAndPushToSheet job:`, error);
     }
 }
 
-
 // --- API ENDPOINTS ---
 app.post('/api/crypto-transactions', async (req, res) => {
+    console.log('\n--- Received new POST request on /api/crypto-transactions ---');
+    console.log('Request Body:', JSON.stringify(req.body, null, 2));
+    console.log('--- End of debug output ---\n');
+
     if (!defaultUser) {
         return res.status(503).json({ error: 'User not initialized.' });
     }
 
+    const data = req.body;
+
     try {
-        const newLog = await CryptoTransaction.create({
-            ...req.body,
-            userId: defaultUser.id
-        });
-        res.status(201).json(newLog);
+        let newLogs;
+        if (Array.isArray(data)) {
+            const transactionsToCreate = data.map(tx => ({
+                ...tx,
+                userId: defaultUser.id
+            }));
+            newLogs = await CryptoTransaction.bulkCreate(transactionsToCreate, { validate: true });
+            console.log(`Successfully bulk created ${newLogs.length} transactions.`);
+        } else {
+            newLogs = await CryptoTransaction.create({
+                ...data,
+                userId: defaultUser.id
+            });
+            console.log('Successfully created a single transaction.');
+        }
+        res.status(201).json(newLogs);
+
     } catch (error) {
         console.error('Error creating crypto transaction log:', error);
         if (error.name === 'SequelizeValidationError') {
@@ -138,12 +143,103 @@ app.post('/api/crypto-transactions', async (req, res) => {
 });
 
 
+// --- *** 升級後的 PnL API 端點 *** ---
+app.get('/api/crypto-transactions/pnl', async (req, res) => {
+    if (!defaultUser) { return res.status(503).json({ error: 'User not initialized.' }); }
+    try {
+        // 1. 只抓取 "持有中" 的交易
+        const transactions = await CryptoTransaction.findAll({
+            where: { userId: defaultUser.id, status: '持有中' },
+            order: [['transactionDate', 'DESC']]
+        });
+
+        if (transactions.length === 0) {
+            return res.json({ details: [], summary: {} }); // 回傳空的結構
+        }
+
+        // 2. 獲取所有需要的即時價格
+        const symbolsToFetch = [...new Set(transactions.map(t => t.targetCoinSymbol))];
+        const prices = await ExchangeRateService.getCryptoPrices(symbolsToFetch);
+
+        // 3. 計算每筆獨立交易的詳細數據
+        const details = transactions.map(tx => {
+            const txData = tx.get({ plain: true });
+            let pnl = null;
+            let roi = null;
+            let currentMarketValue = null;
+            const currentPrice = prices[txData.targetCoinSymbol]?.usd;
+
+            if (currentPrice) {
+                const initialCost = parseFloat(txData.investmentAmount);
+                const fees = parseFloat(txData.fee) || 0;
+                const quantity = txData.currentQuantity ? parseFloat(txData.currentQuantity) : (initialCost / parseFloat(txData.entryPrice));
+                currentMarketValue = quantity * currentPrice;
+                pnl = currentMarketValue - initialCost - fees;
+                if (initialCost > 0) {
+                    roi = (pnl / initialCost) * 100;
+                } else if (pnl > 0) {
+                    roi = Infinity;
+                }
+            }
+            return {
+                ...txData,
+                pnl,
+                roi: roi === Infinity ? '∞' : (roi ? `${roi.toFixed(2)}%` : null),
+                currentMarketValue,
+                currentPrice
+            };
+        });
+
+        // 4. *** 新增的匯總計算邏輯 ***
+        const summary = {};
+        details.forEach(item => {
+            const symbol = item.targetCoinSymbol;
+            if (!summary[symbol]) {
+                summary[symbol] = {
+                    totalInvestment: 0,
+                    totalCurrentValue: 0,
+                    totalPnl: 0,
+                    weightedAvgEntryPrice: 0,
+                    totalQuantity: 0,
+                    currentPrice: item.currentPrice
+                };
+            }
+            const initialCost = parseFloat(item.investmentAmount);
+            const quantity = item.currentQuantity ? parseFloat(item.currentQuantity) : (initialCost / parseFloat(item.entryPrice));
+
+            summary[symbol].totalInvestment += initialCost;
+            summary[symbol].totalCurrentValue += item.currentMarketValue || 0;
+            summary[symbol].totalQuantity += quantity;
+        });
+
+        // 5. 計算總 PnL、ROI 和加權平均成本
+        for (const symbol in summary) {
+            const coin = summary[symbol];
+            coin.totalPnl = coin.totalCurrentValue - coin.totalInvestment;
+            if (coin.totalInvestment > 0) {
+                coin.roi = `${((coin.totalPnl / coin.totalInvestment) * 100).toFixed(2)}%`;
+                coin.weightedAvgEntryPrice = coin.totalInvestment / coin.totalQuantity;
+            } else if (coin.totalPnl > 0) {
+                coin.roi = '∞';
+                coin.weightedAvgEntryPrice = 0;
+            }
+        }
+
+        res.json({ details, summary }); // 將詳細列表和匯總結果一起回傳
+
+    } catch (error) {
+        console.error('Error calculating PnL:', error);
+        res.status(500).json({ error: 'Failed to calculate PnL.' });
+    }
+});
+
+
 // --- Server Start ---
 initializeDatabase().then(() => {
     app.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);
         cron.schedule('*/5 * * * *', fetchAndPushToSheet);
-        console.log('Running the fetchAndPushToSheet job immediately upon server start...');
-        fetchAndPushToSheet();
+        // Disabling immediate run to avoid clutter during debugging
+        // fetchAndPushToSheet();
     });
 });
