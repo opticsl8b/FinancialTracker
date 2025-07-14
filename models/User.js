@@ -27,7 +27,17 @@ module.exports = (sequelize) => {
         }
     }, {
         tableName: 'users',
-        timestamps: true
+        timestamps: true,
+        // *** 核心設定：預設排除密碼欄位 ***
+        defaultScope: {
+            attributes: { exclude: ['password'] },
+        },
+        // *** 輔助設定：在需要時可以明確要求包含密碼 ***
+        scopes: {
+            withPassword: {
+                attributes: { include: ['password'] },
+            },
+        },
     });
 
     User.associate = (models) => {
